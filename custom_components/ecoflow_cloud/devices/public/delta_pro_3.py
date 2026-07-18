@@ -1,9 +1,13 @@
+import logging
+from typing import Any
+
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.select import SelectEntity
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.components.switch import SwitchEntity
 
 from custom_components.ecoflow_cloud.devices import BaseDevice, const
+from custom_components.ecoflow_cloud.devices.data_holder import PreparedData
 from custom_components.ecoflow_cloud.api import EcoflowApiClient
 from custom_components.ecoflow_cloud.number import (
     ChargingPowerEntity,
@@ -28,8 +32,52 @@ from custom_components.ecoflow_cloud.sensor import (
 )
 from custom_components.ecoflow_cloud.switch import BeeperEntity, EnabledEntity
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class DeltaPro3(BaseDevice):
+    # The public quota reports each output's live state in flowInfo* ({0: off,
+    # 2: on}) but NOT the cfg_*_out_open flags the switches read, so without
+    # this the AC/DC output switches sit at "unknown". Derive them per update.
+    _FLOW_INFO_TO_SWITCH_KEY: dict[str, str] = {
+        "flowInfo12v": "cfgDc12vOutOpen",
+        "flowInfo24v": "cfgDc24vOutOpen",
+        "flowInfoAcHvOut": "cfgHvAcOutOpen",
+        "flowInfoAcLvOut": "cfgLvAcOutOpen",
+    }
+
+    def _set_cmd(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Build a public-API set command and log it for toggle verification."""
+        cmd = {
+            "sn": self.device_info.sn,
+            "cmdId": 17,
+            "dirDest": 1,
+            "dirSrc": 1,
+            "cmdFunc": 254,
+            "dest": 2,
+            "params": params,
+        }
+        _LOGGER.info("[DeltaPro3] sending set command: %s", cmd)
+        return cmd
+
+    def _prepare_data_data_topic(self, raw_data: bytes) -> PreparedData:
+        prepared = super()._prepare_data_data_topic(raw_data)
+        data = prepared.params
+        if isinstance(data, dict) and isinstance(data.get("params"), dict):
+            params = data["params"]
+            for flow_key, cfg_key in self._FLOW_INFO_TO_SWITCH_KEY.items():
+                flow = params.get(flow_key)
+                if flow == 2:
+                    params[cfg_key] = 1
+                elif flow == 0:
+                    params[cfg_key] = 0
+        return prepared
+
+    def _prepare_data_set_reply_topic(self, raw_data: bytes) -> PreparedData:
+        prepared = super()._prepare_data_set_reply_topic(raw_data)
+        _LOGGER.info("[DeltaPro3] set_reply: %s", prepared.raw_data)
+        return prepared
+
     def sensors(self, client: EcoflowApiClient) -> list[SensorEntity]:
         return [
             LevelSensorEntity(client, self, "bmsBattSoc", const.MAIN_BATTERY_LEVEL),
@@ -201,60 +249,28 @@ class DeltaPro3(BaseDevice):
                 self,
                 "cfgHvAcOutOpen",
                 "AC HV Output Enabled",
-                lambda value, params=None: {
-                    "sn": self.device_info.sn,
-                    "cmdId": 17,
-                    "dirDest": 1,
-                    "dirSrc": 1,
-                    "cmdFunc": 254,
-                    "dest": 2,
-                    "params": {"cfgHvAcOutOpen": value},
-                },
+                lambda value, params=None: self._set_cmd({"cfgHvAcOutOpen": value}),
             ),
             EnabledEntity(
                 client,
                 self,
                 "cfgLvAcOutOpen",
                 "AC LV Output Enabled",
-                lambda value, params=None: {
-                    "sn": self.device_info.sn,
-                    "cmdId": 17,
-                    "dirDest": 1,
-                    "dirSrc": 1,
-                    "cmdFunc": 254,
-                    "dest": 2,
-                    "params": {"cfgLvAcOutOpen": value},
-                },
+                lambda value, params=None: self._set_cmd({"cfgLvAcOutOpen": value}),
             ),
             EnabledEntity(
                 client,
                 self,
                 "cfgDc12vOutOpen",
                 "12V DC Output Enabled",
-                lambda value, params=None: {
-                    "sn": self.device_info.sn,
-                    "cmdId": 17,
-                    "dirDest": 1,
-                    "dirSrc": 1,
-                    "cmdFunc": 254,
-                    "dest": 2,
-                    "params": {"cfgDc12vOutOpen": value},
-                },
+                lambda value, params=None: self._set_cmd({"cfgDc12vOutOpen": value}),
             ),
             EnabledEntity(
                 client,
                 self,
                 "cfgDc24vOutOpen",
                 "24V DC Output Enabled",
-                lambda value, params=None: {
-                    "sn": self.device_info.sn,
-                    "cmdId": 17,
-                    "dirDest": 1,
-                    "dirSrc": 1,
-                    "cmdFunc": 254,
-                    "dest": 2,
-                    "params": {"cfgDc24vOutOpen": value},
-                },
+                lambda value, params=None: self._set_cmd({"cfgDc24vOutOpen": value}),
             ),
             EnabledEntity(
                 client,
