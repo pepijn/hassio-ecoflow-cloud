@@ -1,11 +1,16 @@
 import logging
 from typing import Any, override
 
+from google.protobuf.json_format import MessageToDict
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.select import SelectEntity
 from homeassistant.components.switch import SwitchEntity
 
 from custom_components.ecoflow_cloud.api import EcoflowApiClient
+from custom_components.ecoflow_cloud.api.message import (
+    Message,
+    PrivateAPIMessageProtocol,
+)
 from custom_components.ecoflow_cloud.devices import BaseInternalDevice, const
 from custom_components.ecoflow_cloud.devices.data_holder import PreparedData
 from custom_components.ecoflow_cloud.devices.internal.proto import (
@@ -65,6 +70,70 @@ BMS_HEARTBEAT_COMMANDS: set[tuple[int, int]] = {
     (32, 51),
     (32, 52),
 }
+
+
+class DP3CommandMessage(PrivateAPIMessageProtocol):
+    """Message wrapper for Delta Pro 3 protobuf set commands."""
+
+    def __init__(self, payload: "dp3.DP3SetCommand", packet: "dp3.DP3SendHeaderMsg"):
+        self._packet = packet
+        self._payload = payload
+
+    @override
+    def to_mqtt_payload(self):
+        return self._packet.SerializeToString()
+
+    @override
+    def to_dict(self) -> dict:
+        payload_dict = MessageToDict(self._payload, preserving_proto_field_name=True)
+        result = MessageToDict(self._packet, preserving_proto_field_name=True)
+        result["msg"][0]["pdata"] = {type(self._payload).__name__: payload_dict}
+        result["msg"][0].pop("seq", None)
+        return {type(self._packet).__name__: result}
+
+
+def _create_dp3_proto_command(
+    field_name: str, value: int, device_sn: str, data_len: int | None = None
+) -> "DP3CommandMessage | None":
+    """Build a Delta Pro 3 private-API protobuf set command.
+
+    The DP3 does not accept the legacy moduleType/operateType/params JSON for
+    its output toggles (that envelope is silently ignored / rejected 1006) — it
+    needs a protobuf DP3SetCommand wrapped in a DP3SendHeaderMsg with cmdFunc
+    254 / cmdId 17, exactly like the Delta 3. The header values
+    (product_id=1, version=19, payload_ver=1, src=32, dest=2, d_src/d_dest=1)
+    match the working Delta 3 / River 3 encoders and the ioBroker DP3 reference.
+    The set fields are camelCase in DP3SetCommand (e.g. cfgDc12vOutOpen) and are
+    declared `optional`, so an explicit 0 (turn-off) is serialized rather than
+    dropped.
+    """
+    payload = dp3.DP3SetCommand()
+    try:
+        setattr(payload, field_name, int(value))
+    except (AttributeError, ValueError):
+        _LOGGER.error("Unknown Delta Pro 3 set field: %s", field_name)
+        return None
+
+    pdata = payload.SerializeToString()
+
+    packet = dp3.DP3SendHeaderMsg()
+    message = packet.msg.add()
+    message.src = 32
+    message.dest = 2
+    message.d_src = 1
+    message.d_dest = 1
+    message.cmd_func = 254
+    message.cmd_id = 17
+    message.need_ack = 1
+    message.seq = Message.gen_seq()
+    message.product_id = 1
+    message.version = 19
+    message.payload_ver = 1
+    message.device_sn = device_sn
+    message.data_len = data_len if data_len is not None else len(pdata)
+    message.pdata = pdata
+
+    return DP3CommandMessage(payload, packet)
 
 
 class DeltaPro3(BaseInternalDevice):
@@ -189,6 +258,7 @@ class DeltaPro3(BaseInternalDevice):
 
     @override
     def switches(self, client: EcoflowApiClient) -> list[SwitchEntity]:
+        device = self
         return [
             # Audio Control
             BeeperEntity(
@@ -208,22 +278,18 @@ class DeltaPro3(BaseInternalDevice):
                 self,
                 "cfg_hv_ac_out_open",
                 "AC HV Output Enabled",
-                lambda value, params=None: {
-                    "moduleType": 0,
-                    "operateType": "TCP",
-                    "params": {"id": 66, "cfgHvAcOutOpen": value},
-                },
+                lambda value, params=None: _create_dp3_proto_command(
+                    "cfgHvAcOutOpen", 1 if value else 0, device.device_data.sn
+                ),
             ),
             EnabledEntity(
                 client,
                 self,
                 "cfg_lv_ac_out_open",
                 "AC LV Output Enabled",
-                lambda value, params=None: {
-                    "moduleType": 0,
-                    "operateType": "TCP",
-                    "params": {"id": 66, "cfgLvAcOutOpen": value},
-                },
+                lambda value, params=None: _create_dp3_proto_command(
+                    "cfgLvAcOutOpen", 1 if value else 0, device.device_data.sn
+                ),
             ),
             # DC Output Control
             EnabledEntity(
@@ -231,12 +297,14 @@ class DeltaPro3(BaseInternalDevice):
                 self,
                 "cfg_dc_12v_out_open",
                 "12V DC Output Enabled",
-                lambda value, params=None: {
-                    "moduleType": 0,
-                    "operateType": "TCP",
-                    "params": {"id": 81, "cfgDc12vOutOpen": value},
-                },
+                lambda value, params=None: _create_dp3_proto_command(
+                    "cfgDc12vOutOpen", 1 if value else 0, device.device_data.sn
+                ),
             ),
+            # NOTE: DP3SetCommand has no cfgDc24vOutOpen field, so the 24V rail
+            # cannot be toggled over the private protobuf API. State is still
+            # derived from flow_info_24v (see _derive_output_switch_states); the
+            # command below is a no-op placeholder the DP3 firmware ignores.
             EnabledEntity(
                 client,
                 self,
