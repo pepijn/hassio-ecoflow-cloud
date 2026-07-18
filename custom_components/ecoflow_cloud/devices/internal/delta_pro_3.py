@@ -507,7 +507,9 @@ class DeltaPro3(BaseInternalDevice):
                 # DisplayPropertyUpload
                 msg_display_upload = dp3.DP3DisplayPropertyUpload()
                 msg_display_upload.ParseFromString(pdata)
-                return self._protobuf_to_dict(msg_display_upload)
+                result = self._protobuf_to_dict(msg_display_upload)
+                self._derive_output_switch_states(result)
+                return result
 
             elif cmd_func == 32 and cmd_id == 2:
                 # cmdFunc32_cmdId2_Report (CMSHeartBeatReport)
@@ -548,7 +550,9 @@ class DeltaPro3(BaseInternalDevice):
                 try:
                     msg_display_report = dp3.DP3DisplayPropertyReport()
                     msg_display_report.ParseFromString(pdata)
-                    return self._protobuf_to_dict(msg_display_report)
+                    result = self._protobuf_to_dict(msg_display_report)
+                    self._derive_output_switch_states(result)
+                    return result
                 except AttributeError:
                     # cmdFunc254_cmdId23_Report class not found, use generic handling
                     _LOGGER.debug("cmdFunc254_cmdId23_Report class not found, using generic handling")
@@ -613,6 +617,35 @@ class DeltaPro3(BaseInternalDevice):
     def _is_bms_heartbeat(self, cmd_func: int, cmd_id: int) -> bool:
         """Return True if the pair maps to a BMSHeartBeatReport message."""
         return (cmd_func, cmd_id) in BMS_HEARTBEAT_COMMANDS
+
+    # Map each output's flow_info_* telemetry field to the cfg_*_out_open key
+    # that its EnabledEntity switch reads for on/off state.
+    _FLOW_INFO_TO_SWITCH_KEY: dict[str, str] = {
+        "flow_info_12v": "cfg_dc_12v_out_open",
+        "flow_info_24v": "cfg_dc_24v_out_open",
+        "flow_info_ac_hv_out": "cfg_hv_ac_out_open",
+        "flow_info_ac_lv_out": "cfg_lv_ac_out_open",
+    }
+
+    def _derive_output_switch_states(self, result: dict[str, Any]) -> None:
+        """Derive AC/DC output switch on/off state from flow_info_* fields.
+
+        The Delta Pro 3 firmware never reports the cfg_*_out_open config flags
+        in telemetry or get_reply snapshots — only in the SetReply after a user
+        toggles an output — so without this derivation the corresponding HA
+        switches stay "unknown" until toggled (see upstream #837). The
+        DisplayPropertyUpload does carry flow_info_* status flags; the ioBroker
+        reference documents every output port's flag as {0: off, 2: on}, and the
+        proto declares them `optional uint32` so an explicit 0 survives decoding.
+        Map only the known 0/2 values onto the switch keys and ignore anything
+        else, so a transient value never overwrites an authoritative SetReply.
+        """
+        for flow_key, switch_key in self._FLOW_INFO_TO_SWITCH_KEY.items():
+            flow = result.get(flow_key)
+            if flow == 2:
+                result[switch_key] = 1
+            elif flow == 0:
+                result[switch_key] = 0
 
     def _flatten_dict(self, d: dict, parent_key: str = "", sep: str = "_") -> dict[str, Any]:
         items: list[tuple[str, Any]] = []
