@@ -54,6 +54,16 @@ class OutputEnabledEntity(EnabledEntity):
 
 
 class DeltaPro3(BaseDevice):
+    # DIAGNOSTIC (temporary): log one raw MQTT /quota message so we can see the
+    # exact structure the device pushes and fix live-quota parsing precisely.
+    _quota_logged: bool = False
+
+    def _prepare_data_data_topic(self, raw_data: bytes) -> PreparedData:
+        if not DeltaPro3._quota_logged:
+            DeltaPro3._quota_logged = True
+            _LOGGER.info("[DeltaPro3] sample raw /quota message: %r", raw_data[:900])
+        return super()._prepare_data_data_topic(raw_data)
+
     def _set_cmd(self, params: dict[str, Any]) -> dict[str, Any]:
         """Build a public-API set command and log it for toggle verification.
 
