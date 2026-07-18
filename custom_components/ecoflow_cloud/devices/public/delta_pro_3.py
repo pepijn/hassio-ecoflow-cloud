@@ -28,7 +28,7 @@ from custom_components.ecoflow_cloud.sensor import (
     LevelSensorEntity,
     # OutVoltSensorEntity,
     OutWattsSensorEntity,
-    QuotaStatusSensorEntity,
+    QuotaScheduledStatusSensorEntity,
     RemainSensorEntity,
     TempSensorEntity,
     # VoltSensorEntity,
@@ -214,7 +214,10 @@ class DeltaPro3(BaseDevice):
             OutWattsSensorEntity(client, self, "powGet4p82", "4P8 Extra Battery Port 2 Power", False, True),
             # OutWattsSensorEntity(client, self, "acOutFreq", "AC Output Frequency"),
             LevelSensorEntity(client, self, "plugInInfoAcInFeq", "AC Input Frequency"),
-            QuotaStatusSensorEntity(client, self),
+            # Poll the full state every 60s (like PowerStream / Delta 3 Max Plus)
+            # so output changes made on the device or app show up automatically —
+            # the DP3 does not push output on/off state live over MQTT.
+            QuotaScheduledStatusSensorEntity(client, self, 60),
         ]
 
     def numbers(self, client: EcoflowApiClient) -> list[NumberEntity]:
