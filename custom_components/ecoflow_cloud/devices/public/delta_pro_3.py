@@ -54,15 +54,17 @@ class OutputEnabledEntity(EnabledEntity):
 
 
 class DeltaPro3(BaseDevice):
-    # DIAGNOSTIC (temporary): log one raw MQTT /quota message so we can see the
-    # exact structure the device pushes and fix live-quota parsing precisely.
-    _quota_logged: bool = False
-
-    def _prepare_data_data_topic(self, raw_data: bytes) -> PreparedData:
-        if not DeltaPro3._quota_logged:
-            DeltaPro3._quota_logged = True
-            _LOGGER.info("[DeltaPro3] sample raw /quota message: %r", raw_data[:900])
-        return super()._prepare_data_data_topic(raw_data)
+    # The device's SetReply echoes the cfg_*_out_open flag it applied; map it to
+    # the flowInfo_* key the output switches read so a toggle updates the switch
+    # immediately. (The live /quota that would carry flowInfo* is only pushed as
+    # flat BMS reports with no "params" wrapper, so the switch would otherwise
+    # revert to its stale startup value.)
+    _CFG_TO_FLOW: dict[str, str] = {
+        "cfgDc12vOutOpen": "flowInfo12v",
+        "cfgDc24vOutOpen": "flowInfo24v",
+        "cfgHvAcOutOpen": "flowInfoAcHvOut",
+        "cfgLvAcOutOpen": "flowInfoAcLvOut",
+    }
 
     def _set_cmd(self, params: dict[str, Any]) -> dict[str, Any]:
         """Build a public-API set command and log it for toggle verification.
@@ -86,7 +88,20 @@ class DeltaPro3(BaseDevice):
 
     def _prepare_data_set_reply_topic(self, raw_data: bytes) -> PreparedData:
         prepared = super()._prepare_data_set_reply_topic(raw_data)
-        _LOGGER.info("[DeltaPro3] set_reply: %s", prepared.raw_data)
+        reply = prepared.raw_data
+        _LOGGER.info("[DeltaPro3] set_reply: %s", reply)
+        # The SetReply confirms the applied output state; reflect it immediately
+        # so the switch doesn't revert to a stale flowInfo_* value.
+        data = reply.get("data") if isinstance(reply, dict) else None
+        if isinstance(data, dict) and data.get("configOk"):
+            update = {
+                flow_key: (2 if data[cfg_key] else 0)
+                for cfg_key, flow_key in self._CFG_TO_FLOW.items()
+                if cfg_key in data
+            }
+            if update:
+                _LOGGER.info("[DeltaPro3] applying set_reply state -> %s", update)
+                return PreparedData(None, {"params": update}, reply)
         return prepared
 
     def sensors(self, client: EcoflowApiClient) -> list[SensorEntity]:
