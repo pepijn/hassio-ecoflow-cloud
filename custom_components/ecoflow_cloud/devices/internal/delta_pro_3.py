@@ -81,7 +81,9 @@ class DP3CommandMessage(PrivateAPIMessageProtocol):
 
     @override
     def to_mqtt_payload(self):
-        return self._packet.SerializeToString()
+        wire = self._packet.SerializeToString()
+        _LOGGER.debug("[DeltaPro3] set command wire bytes: %s", wire.hex())
+        return wire
 
     @override
     def to_dict(self) -> dict:
@@ -133,6 +135,13 @@ def _create_dp3_proto_command(
     message.data_len = data_len if data_len is not None else len(pdata)
     message.pdata = pdata
 
+    _LOGGER.info(
+        "[DeltaPro3] sending set command %s=%s (sn=%s, seq=%s)",
+        field_name,
+        int(value),
+        device_sn,
+        message.seq,
+    )
     return DP3CommandMessage(payload, packet)
 
 
@@ -695,6 +704,14 @@ class DeltaPro3(BaseInternalDevice):
         "flow_info_ac_lv_out": "cfg_lv_ac_out_open",
     }
 
+    # Map the camelCase cfg_* fields the DP3SetReply echoes back to the snake
+    # switch keys, so an accepted toggle updates the switch immediately.
+    _SET_FIELD_TO_SWITCH_KEY: dict[str, str] = {
+        "cfgDc12vOutOpen": "cfg_dc_12v_out_open",
+        "cfgHvAcOutOpen": "cfg_hv_ac_out_open",
+        "cfgLvAcOutOpen": "cfg_lv_ac_out_open",
+    }
+
     def _derive_output_switch_states(self, result: dict[str, Any]) -> None:
         """Derive AC/DC output switch on/off state from flow_info_* fields.
 
@@ -776,5 +793,55 @@ class DeltaPro3(BaseInternalDevice):
 
     @override
     def _prepare_data_set_reply_topic(self, raw_data: bytes) -> PreparedData:
-        # do not expect any params here
-        return PreparedData(None, None, self._prepare_data(raw_data))
+        """Decode the DP3 SetReply the device sends after a set command.
+
+        The reply carries `configOk` (the definitive "command accepted" signal)
+        and echoes the cfg_* field that was applied. We log it at INFO so a
+        toggle can be verified end-to-end, and — when accepted — translate the
+        echoed camelCase cfg fields to the snake switch keys so the switch
+        flips immediately instead of waiting for the next telemetry frame.
+        """
+        try:
+            import base64
+
+            try:
+                raw_data = base64.b64decode(raw_data, validate=True)
+            except Exception:
+                pass  # most payloads are raw protobuf, not base64
+
+            header_msg = dp3.DP3SendHeaderMsg()
+            header_msg.ParseFromString(raw_data)
+            if header_msg.msg:
+                header = header_msg.msg[0]
+                pdata = getattr(header, "pdata", b"")
+                if pdata:
+                    if getattr(header, "enc_type", 0) == 1 and getattr(header, "src", 0) != 32:
+                        pdata = self._xor_decode_pdata(pdata, getattr(header, "seq", 0))
+
+                    reply = dp3.DP3SetReply()
+                    reply.ParseFromString(pdata)
+                    result = self._protobuf_to_dict(reply)
+
+                    config_ok = result.get("configOk", result.get("config_ok"))
+                    applied = {
+                        k: v
+                        for k, v in result.items()
+                        if k not in ("actionId", "action_id", "configOk", "config_ok")
+                    }
+                    _LOGGER.info(
+                        "[DeltaPro3] SetReply: config_ok=%s applied=%s", config_ok, applied
+                    )
+
+                    # Only reflect the new state in HA if the device accepted it.
+                    if config_ok:
+                        for set_key, switch_key in self._SET_FIELD_TO_SWITCH_KEY.items():
+                            if set_key in result:
+                                result[switch_key] = result[set_key]
+
+                    return PreparedData(
+                        None, {"params": self._flatten_dict(result)}, {"proto": raw_data.hex()}
+                    )
+        except Exception as e:
+            _LOGGER.debug("[DeltaPro3] set_reply decode failed: %s", e)
+
+        return PreparedData(None, None, {"proto": raw_data.hex()})
