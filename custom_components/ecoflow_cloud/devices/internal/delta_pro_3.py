@@ -1,16 +1,11 @@
 import logging
 from typing import Any, override
 
-from google.protobuf.json_format import MessageToDict
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.select import SelectEntity
 from homeassistant.components.switch import SwitchEntity
 
 from custom_components.ecoflow_cloud.api import EcoflowApiClient
-from custom_components.ecoflow_cloud.api.message import (
-    Message,
-    PrivateAPIMessageProtocol,
-)
 from custom_components.ecoflow_cloud.devices import BaseInternalDevice, const
 from custom_components.ecoflow_cloud.devices.data_holder import PreparedData
 from custom_components.ecoflow_cloud.devices.internal.proto import (
@@ -70,79 +65,6 @@ BMS_HEARTBEAT_COMMANDS: set[tuple[int, int]] = {
     (32, 51),
     (32, 52),
 }
-
-
-class DP3CommandMessage(PrivateAPIMessageProtocol):
-    """Message wrapper for Delta Pro 3 protobuf set commands."""
-
-    def __init__(self, payload: "dp3.DP3SetCommand", packet: "dp3.DP3SendHeaderMsg"):
-        self._packet = packet
-        self._payload = payload
-
-    @override
-    def to_mqtt_payload(self):
-        wire = self._packet.SerializeToString()
-        _LOGGER.debug("[DeltaPro3] set command wire bytes: %s", wire.hex())
-        return wire
-
-    @override
-    def to_dict(self) -> dict:
-        payload_dict = MessageToDict(self._payload, preserving_proto_field_name=True)
-        result = MessageToDict(self._packet, preserving_proto_field_name=True)
-        result["msg"][0]["pdata"] = {type(self._payload).__name__: payload_dict}
-        result["msg"][0].pop("seq", None)
-        return {type(self._packet).__name__: result}
-
-
-def _create_dp3_proto_command(
-    field_name: str, value: int, device_sn: str, data_len: int | None = None
-) -> "DP3CommandMessage | None":
-    """Build a Delta Pro 3 private-API protobuf set command.
-
-    The DP3 does not accept the legacy moduleType/operateType/params JSON for
-    its output toggles (that envelope is silently ignored / rejected 1006) — it
-    needs a protobuf DP3SetCommand wrapped in a DP3SendHeaderMsg with cmdFunc
-    254 / cmdId 17, exactly like the Delta 3. The header values
-    (product_id=1, version=19, payload_ver=1, src=32, dest=2, d_src/d_dest=1)
-    match the working Delta 3 / River 3 encoders and the ioBroker DP3 reference.
-    The set fields are camelCase in DP3SetCommand (e.g. cfgDc12vOutOpen) and are
-    declared `optional`, so an explicit 0 (turn-off) is serialized rather than
-    dropped.
-    """
-    payload = dp3.DP3SetCommand()
-    try:
-        setattr(payload, field_name, int(value))
-    except (AttributeError, ValueError):
-        _LOGGER.error("Unknown Delta Pro 3 set field: %s", field_name)
-        return None
-
-    pdata = payload.SerializeToString()
-
-    packet = dp3.DP3SendHeaderMsg()
-    message = packet.msg.add()
-    message.src = 32
-    message.dest = 2
-    message.d_src = 1
-    message.d_dest = 1
-    message.cmd_func = 254
-    message.cmd_id = 17
-    message.need_ack = 1
-    message.seq = Message.gen_seq()
-    message.product_id = 1
-    message.version = 19
-    message.payload_ver = 1
-    message.device_sn = device_sn
-    message.data_len = data_len if data_len is not None else len(pdata)
-    message.pdata = pdata
-
-    _LOGGER.info(
-        "[DeltaPro3] sending set command %s=%s (sn=%s, seq=%s)",
-        field_name,
-        int(value),
-        device_sn,
-        message.seq,
-    )
-    return DP3CommandMessage(payload, packet)
 
 
 class DeltaPro3(BaseInternalDevice):
@@ -267,7 +189,6 @@ class DeltaPro3(BaseInternalDevice):
 
     @override
     def switches(self, client: EcoflowApiClient) -> list[SwitchEntity]:
-        device = self
         return [
             # Audio Control
             BeeperEntity(
@@ -287,18 +208,22 @@ class DeltaPro3(BaseInternalDevice):
                 self,
                 "cfg_hv_ac_out_open",
                 "AC HV Output Enabled",
-                lambda value, params=None: _create_dp3_proto_command(
-                    "cfgHvAcOutOpen", 1 if value else 0, device.device_data.sn
-                ),
+                lambda value, params=None: {
+                    "moduleType": 0,
+                    "operateType": "TCP",
+                    "params": {"id": 66, "cfgHvAcOutOpen": value},
+                },
             ),
             EnabledEntity(
                 client,
                 self,
                 "cfg_lv_ac_out_open",
                 "AC LV Output Enabled",
-                lambda value, params=None: _create_dp3_proto_command(
-                    "cfgLvAcOutOpen", 1 if value else 0, device.device_data.sn
-                ),
+                lambda value, params=None: {
+                    "moduleType": 0,
+                    "operateType": "TCP",
+                    "params": {"id": 66, "cfgLvAcOutOpen": value},
+                },
             ),
             # DC Output Control
             EnabledEntity(
@@ -306,14 +231,12 @@ class DeltaPro3(BaseInternalDevice):
                 self,
                 "cfg_dc_12v_out_open",
                 "12V DC Output Enabled",
-                lambda value, params=None: _create_dp3_proto_command(
-                    "cfgDc12vOutOpen", 1 if value else 0, device.device_data.sn
-                ),
+                lambda value, params=None: {
+                    "moduleType": 0,
+                    "operateType": "TCP",
+                    "params": {"id": 81, "cfgDc12vOutOpen": value},
+                },
             ),
-            # NOTE: DP3SetCommand has no cfgDc24vOutOpen field, so the 24V rail
-            # cannot be toggled over the private protobuf API. State is still
-            # derived from flow_info_24v (see _derive_output_switch_states); the
-            # command below is a no-op placeholder the DP3 firmware ignores.
             EnabledEntity(
                 client,
                 self,
@@ -584,9 +507,7 @@ class DeltaPro3(BaseInternalDevice):
                 # DisplayPropertyUpload
                 msg_display_upload = dp3.DP3DisplayPropertyUpload()
                 msg_display_upload.ParseFromString(pdata)
-                result = self._protobuf_to_dict(msg_display_upload)
-                self._derive_output_switch_states(result)
-                return result
+                return self._protobuf_to_dict(msg_display_upload)
 
             elif cmd_func == 32 and cmd_id == 2:
                 # cmdFunc32_cmdId2_Report (CMSHeartBeatReport)
@@ -627,9 +548,7 @@ class DeltaPro3(BaseInternalDevice):
                 try:
                     msg_display_report = dp3.DP3DisplayPropertyReport()
                     msg_display_report.ParseFromString(pdata)
-                    result = self._protobuf_to_dict(msg_display_report)
-                    self._derive_output_switch_states(result)
-                    return result
+                    return self._protobuf_to_dict(msg_display_report)
                 except AttributeError:
                     # cmdFunc254_cmdId23_Report class not found, use generic handling
                     _LOGGER.debug("cmdFunc254_cmdId23_Report class not found, using generic handling")
@@ -695,43 +614,6 @@ class DeltaPro3(BaseInternalDevice):
         """Return True if the pair maps to a BMSHeartBeatReport message."""
         return (cmd_func, cmd_id) in BMS_HEARTBEAT_COMMANDS
 
-    # Map each output's flow_info_* telemetry field to the cfg_*_out_open key
-    # that its EnabledEntity switch reads for on/off state.
-    _FLOW_INFO_TO_SWITCH_KEY: dict[str, str] = {
-        "flow_info_12v": "cfg_dc_12v_out_open",
-        "flow_info_24v": "cfg_dc_24v_out_open",
-        "flow_info_ac_hv_out": "cfg_hv_ac_out_open",
-        "flow_info_ac_lv_out": "cfg_lv_ac_out_open",
-    }
-
-    # Map the camelCase cfg_* fields the DP3SetReply echoes back to the snake
-    # switch keys, so an accepted toggle updates the switch immediately.
-    _SET_FIELD_TO_SWITCH_KEY: dict[str, str] = {
-        "cfgDc12vOutOpen": "cfg_dc_12v_out_open",
-        "cfgHvAcOutOpen": "cfg_hv_ac_out_open",
-        "cfgLvAcOutOpen": "cfg_lv_ac_out_open",
-    }
-
-    def _derive_output_switch_states(self, result: dict[str, Any]) -> None:
-        """Derive AC/DC output switch on/off state from flow_info_* fields.
-
-        The Delta Pro 3 firmware never reports the cfg_*_out_open config flags
-        in telemetry or get_reply snapshots — only in the SetReply after a user
-        toggles an output — so without this derivation the corresponding HA
-        switches stay "unknown" until toggled (see upstream #837). The
-        DisplayPropertyUpload does carry flow_info_* status flags; the ioBroker
-        reference documents every output port's flag as {0: off, 2: on}, and the
-        proto declares them `optional uint32` so an explicit 0 survives decoding.
-        Map only the known 0/2 values onto the switch keys and ignore anything
-        else, so a transient value never overwrites an authoritative SetReply.
-        """
-        for flow_key, switch_key in self._FLOW_INFO_TO_SWITCH_KEY.items():
-            flow = result.get(flow_key)
-            if flow == 2:
-                result[switch_key] = 1
-            elif flow == 0:
-                result[switch_key] = 0
-
     def _flatten_dict(self, d: dict, parent_key: str = "", sep: str = "_") -> dict[str, Any]:
         items: list[tuple[str, Any]] = []
         for k, v in d.items():
@@ -793,55 +675,5 @@ class DeltaPro3(BaseInternalDevice):
 
     @override
     def _prepare_data_set_reply_topic(self, raw_data: bytes) -> PreparedData:
-        """Decode the DP3 SetReply the device sends after a set command.
-
-        The reply carries `configOk` (the definitive "command accepted" signal)
-        and echoes the cfg_* field that was applied. We log it at INFO so a
-        toggle can be verified end-to-end, and — when accepted — translate the
-        echoed camelCase cfg fields to the snake switch keys so the switch
-        flips immediately instead of waiting for the next telemetry frame.
-        """
-        try:
-            import base64
-
-            try:
-                raw_data = base64.b64decode(raw_data, validate=True)
-            except Exception:
-                pass  # most payloads are raw protobuf, not base64
-
-            header_msg = dp3.DP3SendHeaderMsg()
-            header_msg.ParseFromString(raw_data)
-            if header_msg.msg:
-                header = header_msg.msg[0]
-                pdata = getattr(header, "pdata", b"")
-                if pdata:
-                    if getattr(header, "enc_type", 0) == 1 and getattr(header, "src", 0) != 32:
-                        pdata = self._xor_decode_pdata(pdata, getattr(header, "seq", 0))
-
-                    reply = dp3.DP3SetReply()
-                    reply.ParseFromString(pdata)
-                    result = self._protobuf_to_dict(reply)
-
-                    config_ok = result.get("configOk", result.get("config_ok"))
-                    applied = {
-                        k: v
-                        for k, v in result.items()
-                        if k not in ("actionId", "action_id", "configOk", "config_ok")
-                    }
-                    _LOGGER.info(
-                        "[DeltaPro3] SetReply: config_ok=%s applied=%s", config_ok, applied
-                    )
-
-                    # Only reflect the new state in HA if the device accepted it.
-                    if config_ok:
-                        for set_key, switch_key in self._SET_FIELD_TO_SWITCH_KEY.items():
-                            if set_key in result:
-                                result[switch_key] = result[set_key]
-
-                    return PreparedData(
-                        None, {"params": self._flatten_dict(result)}, {"proto": raw_data.hex()}
-                    )
-        except Exception as e:
-            _LOGGER.debug("[DeltaPro3] set_reply decode failed: %s", e)
-
-        return PreparedData(None, None, {"proto": raw_data.hex()})
+        # do not expect any params here
+        return PreparedData(None, None, self._prepare_data(raw_data))
