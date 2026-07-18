@@ -94,7 +94,6 @@ class DeltaPro3(BaseDevice):
     # revert to its stale startup value.)
     _CFG_TO_FLOW: dict[str, str] = {
         "cfgDc12vOutOpen": "flowInfo12v",
-        "cfgDc24vOutOpen": "flowInfo24v",
         "cfgHvAcOutOpen": "flowInfoAcHvOut",
         "cfgLvAcOutOpen": "flowInfoAcLvOut",
     }
@@ -329,14 +328,6 @@ class DeltaPro3(BaseDevice):
                 "flowInfo12v",
                 "12V DC Output Enabled",
                 lambda value, params=None: self._set_cmd({"cfgDc12vOutOpen": value == 2}),
-            ),
-            OutputEnabledEntity(
-                client,
-                self,
-                "cfgDc24vOutOpen",
-                "flowInfo24v",
-                "24V DC Output Enabled",
-                lambda value, params=None: self._set_cmd({"cfgDc24vOutOpen": value == 2}),
             ),
             EnabledEntity(
                 client,
