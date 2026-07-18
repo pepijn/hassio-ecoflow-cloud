@@ -2,6 +2,7 @@ import logging
 import time
 from typing import Any
 
+from homeassistant.components.button import ButtonEntity
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.select import SelectEntity
 from homeassistant.components.sensor import SensorEntity
@@ -9,6 +10,7 @@ from homeassistant.components.switch import SwitchEntity
 
 from custom_components.ecoflow_cloud.devices import BaseDevice, const
 from custom_components.ecoflow_cloud.devices.data_holder import PreparedData
+from custom_components.ecoflow_cloud.entities import EcoFlowAbstractEntity
 from custom_components.ecoflow_cloud.api import EcoflowApiClient
 from custom_components.ecoflow_cloud.number import (
     ChargingPowerEntity,
@@ -86,6 +88,21 @@ class OutputEnabledEntity(EnabledEntity):
         return super()._update_value(val)
 
 
+class RefreshStatesButton(ButtonEntity, EcoFlowAbstractEntity):
+    """Manually pull the full device state from the HTTP quota API on demand.
+
+    Useful because the DP3 does not push output on/off state live over MQTT, so
+    changes made on the device or the EcoFlow app only appear after a poll.
+    """
+
+    def __init__(self, client: EcoflowApiClient, device: BaseDevice):
+        super().__init__(client, device, "Refresh States", "refresh_states")
+
+    async def async_press(self) -> None:
+        _LOGGER.info("[DeltaPro3] manual refresh: fetching quota_all")
+        await self._client.quota_all(self._device.device_info.sn)
+
+
 class DeltaPro3(BaseDevice):
     # The device's SetReply echoes the cfg_*_out_open flag it applied; map it to
     # the flowInfo_* key the output switches read so a toggle updates the switch
@@ -136,6 +153,9 @@ class DeltaPro3(BaseDevice):
                 _LOGGER.info("[DeltaPro3] applying set_reply state -> %s", update)
                 return PreparedData(None, {"params": update}, reply)
         return prepared
+
+    def buttons(self, client: EcoflowApiClient) -> list[ButtonEntity]:
+        return [RefreshStatesButton(client, self)]
 
     def sensors(self, client: EcoflowApiClient) -> list[SensorEntity]:
         return [
