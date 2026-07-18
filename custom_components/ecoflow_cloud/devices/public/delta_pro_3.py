@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.number import NumberEntity
@@ -47,10 +48,42 @@ class OutputEnabledEntity(EnabledEntity):
     so the entity id and the set-command payload are unchanged.
     """
 
+    # After a toggle the EcoFlow cloud keeps reporting the OLD flowInfo_* value
+    # for a few seconds, which would briefly flip the switch back. Hold the
+    # commanded state until the reported value agrees (or this window elapses).
+    _HOLD_SECONDS = 20
+
     def __init__(self, client, device, cfg_key: str, flow_key: str, title: str, command):
         super().__init__(client, device, cfg_key, title, command, enableValue=2, disableValue=0)
         # read on/off state from the flowInfo_* key rather than the cfg_* flag
         self._mqtt_key_expr = jp.parse(self._adopt_json_key(flow_key))
+        self._hold_state: bool | None = None
+        self._hold_until: float = 0.0
+
+    def _begin_hold(self, state: bool) -> None:
+        self._hold_state = state
+        self._hold_until = time.monotonic() + self._HOLD_SECONDS
+        self._attr_is_on = state
+        self.schedule_update_ha_state()
+
+    def turn_on(self, **kwargs: Any) -> None:
+        super().turn_on(**kwargs)
+        self._begin_hold(True)
+
+    def turn_off(self, **kwargs: Any) -> None:
+        super().turn_off(**kwargs)
+        self._begin_hold(False)
+
+    def _update_value(self, val: Any) -> bool:
+        if self._hold_state is not None and time.monotonic() < self._hold_until:
+            if (val == 2) == self._hold_state:
+                self._hold_state = None  # reported state caught up; release hold
+            else:
+                self._attr_is_on = self._hold_state  # ignore lagged value
+                return True
+        else:
+            self._hold_state = None
+        return super()._update_value(val)
 
 
 class DeltaPro3(BaseDevice):
